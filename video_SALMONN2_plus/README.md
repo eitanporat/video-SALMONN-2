@@ -34,6 +34,9 @@ video-SALMONN 2+ is built on Qwen 2.5-VL using a similar pipeline of video-SALMO
 | video-SALMONN 2+ 72B | **77.8** | 66.4               | **69.84**     | **55.6**        |
 
 ## How to Use
+
+**IMPORTANT**: To get the same evaluation result, please use `--max_frames 768 --max_pixels 61250`. Using excessively high resolution or frame rate for evaluation may lead to too much input token count for the model, potentially causing performance degradation.
+
 1. Prepare the dataset following `scripts/example_av.json`, `scripts/example_v.json`, `scripts/example_dpo.json`, and `scripts/example_a.json`
 2. Prepare base audio model through modifying the path in `gen_audio_model.py`
 3. To conduct audio alignment, use the following script:
