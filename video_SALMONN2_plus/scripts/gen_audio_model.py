@@ -3,8 +3,8 @@ from transformers import AutoTokenizer, AutoModelForSpeechSeq2Seq
 import torch
 import shutil
 
-path_in = "Qwen2.5-VL-72B-Instruct"
-path_to_save = "Qwen2.5-VL-72B-Instruct-Audio"
+path_in = "Qwen/Qwen2.5-VL-7B-Instruct"
+path_to_save = "/home/eporat/txt2img/txt2img/captioner/video_SALMONN_2/video_SALMONN2_plus/output/models/Qwen2.5-VL-7B-Instruct-Audio"
 
 tokenizer = AutoTokenizer.from_pretrained(
     path_in,
@@ -14,10 +14,10 @@ tokenizer = AutoTokenizer.from_pretrained(
 )
 
 tokenizer.add_tokens(["<|audio_pad|>"])
-# 
+#
 tokenizer.save_pretrained(path_to_save)
 
-attn_implementation="flash_attention_2"
+attn_implementation = "flash_attention_2"
 
 model = video_SALMONN2_plus.from_pretrained(
     path_in,
@@ -32,7 +32,10 @@ whisper_model = AutoModelForSpeechSeq2Seq.from_pretrained(
 )
 
 for k, v in model.audio.named_parameters():
-    if k in whisper_model.model.encoder.state_dict() and v.shape == whisper_model.model.encoder.state_dict()[k].shape:
+    if (
+        k in whisper_model.model.encoder.state_dict()
+        and v.shape == whisper_model.model.encoder.state_dict()[k].shape
+    ):
         v.data = whisper_model.model.encoder.state_dict()[k].data
     else:
         print(k)
@@ -41,12 +44,8 @@ model.audio.q_tokens.data.normal_(mean=0.0, std=0.02)
 
 model.save_pretrained(path_to_save)
 
-shutil.copy(
-    f"{path_in}/chat_template.json",
-    f"{path_to_save}/chat_template.json"
-)
+shutil.copy(f"{path_in}/chat_template.json", f"{path_to_save}/chat_template.json")
 
 shutil.copy(
-    f"{path_in}/preprocessor_config.json",
-    f"{path_to_save}/preprocessor_config.json"
+    f"{path_in}/preprocessor_config.json", f"{path_to_save}/preprocessor_config.json"
 )

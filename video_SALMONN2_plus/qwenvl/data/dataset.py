@@ -39,6 +39,7 @@ import transformers
 
 from .rope2d import get_rope_index_25, get_rope_index_2
 from decord import VideoReader, cpu
+from .qwen_dataset import make_qwen_lazy_iterator
 
 IGNORE_INDEX = -100
 IMAGE_TOKEN_INDEX = 151655
@@ -49,6 +50,7 @@ DEFAULT_AUDIO_TOKEN = "<audio>"
 
 local_rank = None
 
+
 def rank0_print(*args):
     if local_rank == 0:
         print(*args)
@@ -57,6 +59,7 @@ def rank0_print(*args):
 def read_jsonl(path):
     with open(path, "r") as f:
         return [json.loads(line) for line in f]
+
 
 def split_into_groups(counts, groups):
     result = []
@@ -67,25 +70,35 @@ def split_into_groups(counts, groups):
         result.append(group_list)
     return result
 
+
 def generate_id_target(
     source,
-    grid_thw_image, 
-    grid_thw_video, 
-    audio_lengths, 
-    tokenizer, 
+    grid_thw_image,
+    grid_thw_video,
+    audio_lengths,
+    tokenizer,
     target_role,
     merge_size: int = 2,
+    use_system: bool = False,
 ):
     visual_replicate_index_image = 0
     visual_replicate_index_video = 0
-    roles = {"human": "user", "gpt": "assistant", "chosen": "assistant", "reject": "assistant"}
-    system_message = "You are a helpful assistant."
+    roles = {
+        "human": "user",
+        "gpt": "assistant",
+        "chosen": "assistant",
+        "reject": "assistant",
+    }
     input_id, target = [], []
 
-    input_id += tokenizer.apply_chat_template(
-        [{"role": "system", "content": system_message}]
-    )
-    target += [IGNORE_INDEX] * len(input_id)
+    system_message = "You are a helpful assistant."
+
+    if use_system:
+        input_id += tokenizer.apply_chat_template(
+            [{"role": "system", "content": system_message}]
+        )
+        target += [IGNORE_INDEX] * len(input_id)
+
     for conv in source:
         try:
             role = conv["role"]
@@ -105,8 +118,7 @@ def generate_id_target(
                     new_parts.append(parts[i])
                     replacement = (
                         "<|vision_start|>"
-                        + f"<|image_pad|>"
-                        * grid_thw_image[i]
+                        + f"<|image_pad|>" * grid_thw_image[i]
                         + "<|vision_end|>"
                     )
                     new_parts.append(replacement)
@@ -125,8 +137,7 @@ def generate_id_target(
                         new_parts.append(parts[i])
                         replacement = (
                             "<|vision_start|>"
-                            + f"<|video_pad|>"
-                            * grid_thw_video[i]
+                            + f"<|video_pad|>" * grid_thw_video[i]
                             + "<|vision_end|>"
                         )
                         new_parts.append(replacement)
@@ -135,20 +146,25 @@ def generate_id_target(
                 else:
                     for i in range(len(parts) - 1):
                         new_parts.append(parts[i])
-                        per_timestep_audio_len = split_into_groups(audio_lengths, [grid_thw_video[i][0] for i in range(len(grid_thw_video))])
+                        per_timestep_audio_len = split_into_groups(
+                            audio_lengths,
+                            [grid_thw_video[i][0] for i in range(len(grid_thw_video))],
+                        )
                         replacement = "<|vision_start|>"
                         for timestep in range(grid_thw_video[i][0]):
                             replacement += (
-                                f"<|video_pad|>" 
-                                * (grid_thw_video[i][1] * grid_thw_video[i][2] // merge_size**2)
-                                + f"<|audio_pad|>"
-                                * per_timestep_audio_len[i][timestep]
+                                f"<|video_pad|>"
+                                * (
+                                    grid_thw_video[i][1]
+                                    * grid_thw_video[i][2]
+                                    // merge_size**2
+                                )
+                                + f"<|audio_pad|>" * per_timestep_audio_len[i][timestep]
                             )
                         replacement += "<|vision_end|>"
                         new_parts.append(replacement)
                     new_parts.append(parts[-1])
                     content = "".join(new_parts)
-                            
 
             if "<audio>" in content:
                 parts = content.split("<audio>")
@@ -156,9 +172,8 @@ def generate_id_target(
                 for i in range(len(parts) - 1):
                     new_parts.append(parts[i])
                     replacement = (
-                        "<|vision_start|>" # no need to train more start token
-                        + f"<|audio_pad|>"
-                        * audio_lengths[i]
+                        "<|vision_start|>"  # no need to train more start token
+                        + f"<|audio_pad|>" * audio_lengths[i]
                         + "<|vision_end|>"
                     )
                     new_parts.append(replacement)
@@ -181,14 +196,21 @@ def preprocess_qwen_2_visual(
     tokenizer: transformers.PreTrainedTokenizer,
     grid_thw_image: List = [],
     grid_thw_video: List = [],
-    audio_lengths = None,
+    audio_lengths=None,
     merge_size=2,
 ) -> Dict:
     tokenizer = copy.deepcopy(tokenizer)
     chat_template = "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
     tokenizer.chat_template = chat_template
 
-    input_ids, targets, chosen_ids, chosen_targets, reject_ids, reject_targets = [], [], [], [], [], []
+    input_ids, targets, chosen_ids, chosen_targets, reject_ids, reject_targets = (
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+    )
 
     is_dpo_data = False
     for i, source in enumerate(sources):
@@ -208,23 +230,50 @@ def preprocess_qwen_2_visual(
             if role in ["chosen", "reject"]:
                 is_dpo_data = True
                 break
-        
-        input_id, target = generate_id_target(source, grid_thw_image, grid_thw_video, audio_lengths, tokenizer, "gpt", merge_size)
+
+        input_id, target = generate_id_target(
+            source,
+            grid_thw_image,
+            grid_thw_video,
+            audio_lengths,
+            tokenizer,
+            "gpt",
+            merge_size,
+        )
         assert len(input_id) == len(target), f"{len(input_id)} != {len(target)}"
         input_ids.append(input_id)
         targets.append(target)
 
         if is_dpo_data:
-            chosen_id, chosen_target = generate_id_target(source, grid_thw_image, grid_thw_video, audio_lengths, tokenizer, "chosen", merge_size)
-            reject_id, reject_target = generate_id_target(source, grid_thw_image, grid_thw_video, audio_lengths, tokenizer, "reject", merge_size)
+            chosen_id, chosen_target = generate_id_target(
+                source,
+                grid_thw_image,
+                grid_thw_video,
+                audio_lengths,
+                tokenizer,
+                "chosen",
+                merge_size,
+            )
+            reject_id, reject_target = generate_id_target(
+                source,
+                grid_thw_image,
+                grid_thw_video,
+                audio_lengths,
+                tokenizer,
+                "reject",
+                merge_size,
+            )
 
-            assert len(chosen_id) == len(chosen_target), f"{len(chosen_id)}!= {len(chosen_target)}"
-            assert len(reject_id) == len(reject_target), f"{len(reject_id)}!= {len(reject_target)}"
+            assert len(chosen_id) == len(
+                chosen_target
+            ), f"{len(chosen_id)}!= {len(chosen_target)}"
+            assert len(reject_id) == len(
+                reject_target
+            ), f"{len(reject_id)}!= {len(reject_target)}"
             chosen_ids.append(chosen_id)
             chosen_targets.append(chosen_target)
             reject_ids.append(reject_id)
             reject_targets.append(reject_target)
-
 
     input_ids = torch.tensor(input_ids, dtype=torch.long)
     targets = torch.tensor(targets, dtype=torch.long)
@@ -239,7 +288,6 @@ def preprocess_qwen_2_visual(
         reject_ids = None
         reject_targets = None
 
-    
     return dict(
         input_ids=input_ids,
         labels=targets,
@@ -256,44 +304,55 @@ class LazySupervisedDataset(Dataset):
     def __init__(self, tokenizer: transformers.PreTrainedTokenizer, data_args):
         super(LazySupervisedDataset, self).__init__()
 
-        dataset = data_args.dataset_use.split(",")
-        dataset_list = dataset
-        rank0_print(f"Loading datasets: {dataset_list}")
+        if data_args.use_iterator:
+            dataset_list = []
+            rank0_print("Using iterator for data loading")
+        else:
+            dataset = data_args.dataset_use.split(",")
+            dataset_list = dataset
+            rank0_print(f"Loading datasets: {dataset_list}")
         self.video_max_total_pixels = getattr(
             data_args, "video_max_total_pixels", 1664 * 28 * 28
         )
         self.video_min_total_pixels = getattr(
             data_args, "video_min_total_pixels", 256 * 28 * 28
         )
-        self.model_type = data_args.model_type
-        if data_args.model_type == "qwen2.5vl":
-            self.get_rope_index = get_rope_index_25
-        else:
-            self.get_rope_index = get_rope_index_2
+        self.get_rope_index = get_rope_index_25
 
         list_data_dict = []
 
-        for data in dataset_list:
-            file_format = data.split(".")[-1]
-            if file_format == "jsonl":
-                annotations = read_jsonl(data)
-            else:
-                annotations = json.load(open(data, "r"))
-            list_data_dict += annotations
+        if not data_args.use_iterator:
+            for data in dataset_list:
+                file_format = data.split(".")[-1]
+                if file_format == "jsonl":
+                    annotations = read_jsonl(data)
+                else:
+                    annotations = json.load(open(data, "r"))
+                list_data_dict += annotations
 
-        for d in list_data_dict:
-            if "<image>" in d["conversations"][0]["value"] and not "image" in d and "video" in d:
-                d["conversations"][0]["value"] = d["conversations"][0]["value"].replace(
-                    "<image>", "<video>"
-                )
-            if "<image>" in d["conversations"][0]["value"] and not "image" in d and not "video" in d and "audio" in d:
-                d["conversations"][0]["value"] = d["conversations"][0]["value"].replace(
-                    "<image>", "<audio>"
-                )
+            for d in list_data_dict:
+                if (
+                    "<image>" in d["conversations"][0]["value"]
+                    and not "image" in d
+                    and "video" in d
+                ):
+                    d["conversations"][0]["value"] = d["conversations"][0][
+                        "value"
+                    ].replace("<image>", "<video>")
+                if (
+                    "<image>" in d["conversations"][0]["value"]
+                    and not "image" in d
+                    and not "video" in d
+                    and "audio" in d
+                ):
+                    d["conversations"][0]["value"] = d["conversations"][0][
+                        "value"
+                    ].replace("<image>", "<audio>")
 
-        rank0_print(f"Total training samples: {len(list_data_dict)}")
-
-        random.shuffle(list_data_dict)  # Randomly shuffle the data for training
+            rank0_print(f"Total training samples: {len(list_data_dict)}")
+            random.shuffle(list_data_dict)  # Randomly shuffle the data for training
+        else:
+            rank0_print("Using iterator - skipping dataset file loading")
 
         rank0_print("Formatting inputs...Skip in lazy mode")
         self.tokenizer = tokenizer
@@ -303,9 +362,18 @@ class LazySupervisedDataset(Dataset):
         self.data_args.image_processor.min_pixels = data_args.min_pixels
         self.data_args.image_processor.size["longest_edge"] = data_args.max_pixels
         self.data_args.image_processor.size["shortest_edge"] = data_args.min_pixels
+        self.iterator = (
+            make_qwen_lazy_iterator(batch_size=1, debug_mode=False)
+            if data_args.use_iterator
+            else None
+        )
 
     def __len__(self):
-        return len(self.list_data_dict)
+        return (
+            self.data_args.num_train_samples
+            if self.iterator
+            else len(self.list_data_dict)
+        )
 
     @property
     def lengths(self):
@@ -340,6 +408,15 @@ class LazySupervisedDataset(Dataset):
             print("No pre-calculated length available.")
             return np.array([1] * len(self.list_data_dict))
 
+    def save_debug_video(self, file_buffer):
+        """Save problematic video file for debugging"""
+        debug_dir = "/home/eporat/txt2img/txt2img/captioner/video_SALMONN_2/"
+        debug_path = f"{debug_dir}/debug_video_{os.getpid()}.mp4"
+        with open(debug_path, "wb") as f:
+            file_buffer.seek(0)
+            f.write(file_buffer.getvalue())
+        print(f"Saved problematic video to: {debug_path}")
+
     def process_audio(self, audio_file):
         try:
             audio_kwargs = {
@@ -351,6 +428,7 @@ class LazySupervisedDataset(Dataset):
             if isinstance(audio_file, list):
                 audio_data = []
                 for file in audio_file:
+                    file.seek(0)
                     decoder = AudioDecoder(
                         file,
                         sample_rate=audio_kwargs["sampling_rate"],
@@ -359,6 +437,7 @@ class LazySupervisedDataset(Dataset):
                     audio = decoder.get_all_samples()
                     audio_data.append(audio.data.numpy().squeeze(0))
             else:
+                audio_file.seek(0)
                 decoder = AudioDecoder(
                     audio_file,
                     sample_rate=audio_kwargs["sampling_rate"],
@@ -366,20 +445,59 @@ class LazySupervisedDataset(Dataset):
                 )
                 audio = decoder.get_all_samples()
                 audio_data = [audio.data.numpy().squeeze(0)]
+
+                # # write audio to file
+                # from soundfile import write
+
+                # audio_array = audio.data.numpy().squeeze(0)
+                # write(
+                #     file="audio_lazy.wav",
+                #     data=audio_array,
+                #     samplerate=audio_kwargs["sampling_rate"],
+                # )
+
             audio_inputs = []
             audio_lengths = []
             for idx in range(len(audio_data)):
                 if audio_data[idx].shape[0] < audio_kwargs["sampling_rate"]:
                     padding = audio_kwargs["sampling_rate"] - audio_data[idx].shape[0]
-                    audio_data[idx] = np.pad(audio_data[idx], (0, padding), mode="constant", constant_values=0)
-                audio_lst = [audio_data[idx][k: k + 30 * audio_kwargs["sampling_rate"]] for k in range(0, len(audio_data[idx]), 30 * audio_kwargs["sampling_rate"])]
-                spectrogram_lst = [processor(a, sampling_rate=audio_kwargs["sampling_rate"], return_tensors="pt")["input_features"].squeeze() for a in audio_lst]
-                audio_inputs.append(torch.stack(spectrogram_lst, dim=0))
-                audio_lengths.append(math.ceil(len(audio_data[idx]) / (30 * audio_kwargs["sampling_rate"])) * 60)
-            return audio_inputs, audio_lengths
-        except:
-            return None, None
+                    audio_data[idx] = np.pad(
+                        audio_data[idx],
+                        (0, padding),
+                        mode="constant",
+                        constant_values=0,
+                    )
+                audio_lst = [
+                    audio_data[idx][k : k + 30 * audio_kwargs["sampling_rate"]]
+                    for k in range(
+                        0, len(audio_data[idx]), 30 * audio_kwargs["sampling_rate"]
+                    )
+                ]
 
+                print(
+                    f"audio_data: {audio_data[idx].shape} {len(audio_lst)=} {audio_lst[0].shape=}\n{audio_lst[0]=}"
+                )
+
+                spectrogram_lst = [
+                    processor(
+                        a,
+                        sampling_rate=audio_kwargs["sampling_rate"],
+                        return_tensors="pt",
+                    )["input_features"].squeeze()
+                    for a in audio_lst
+                ]
+                audio_inputs.append(torch.stack(spectrogram_lst, dim=0))
+                audio_lengths.append(
+                    math.ceil(
+                        len(audio_data[idx]) / (30 * audio_kwargs["sampling_rate"])
+                    )
+                    * 60
+                )
+            return audio_inputs, audio_lengths
+        except Exception as e:
+            print(f"Audio processing failed: {e}")
+            self.save_debug_video(audio_file)
+            raise e
 
     def process_image_unified(self, image_file):
         processor = copy.deepcopy(self.data_args.image_processor)
@@ -395,10 +513,12 @@ class LazySupervisedDataset(Dataset):
     def process_video(self, video_file):
         torchcodec_video = None
         try:
+            video_file.seek(0)
             torchcodec_video = self.video_torchcodec(video_file)
             return torchcodec_video
         except:
             try:
+                video_file.seek(0)
                 decord_video = self.read_video_decord(video_file)
                 return decord_video
             except Exception as e:
@@ -411,19 +531,19 @@ class LazySupervisedDataset(Dataset):
         interval = getattr(self.data_args, "base_interval", 4)
         avg_fps = max(round(ori_fps * interval), 1)
         video_length = total_frame_num / ori_fps
-        
+
         video_min_frames = getattr(self.data_args, "video_min_frames", 4)
         video_max_frames = getattr(self.data_args, "video_max_frames", 8)
         frame_idx = [k for k in range(0, total_frame_num, round(avg_fps))]
         if len(frame_idx) > video_max_frames:
-            frame_idx = np.linspace(0, total_frame_num - 1, video_max_frames, dtype=int).tolist()
+            frame_idx = np.linspace(
+                0, total_frame_num - 1, video_max_frames, dtype=int
+            ).tolist()
         video = vr.get_batch(frame_idx).asnumpy().transpose(0, 3, 1, 2)
         return self.process_video_frames(video, frame_idx, video_length)
 
-    def video_torchcodec(self, video_file):
-        device = "cpu"  # or e.g. "cuda"
-        decoder = VideoDecoder(video_file, device=device)
-        total_frames = decoder.metadata.num_frames
+    def subsample_video(self, decoder):
+        total_frames = decoder.metadata.num_frames - 5  # hack for yoav
         avg_fps = decoder.metadata.average_fps
         video_length = total_frames / avg_fps
         interval = getattr(self.data_args, "base_interval", 4)
@@ -439,6 +559,13 @@ class LazySupervisedDataset(Dataset):
         frame_idx = np.unique(frame_idx)
         frame_batch = decoder.get_frames_at(indices=frame_idx.tolist())
         video = frame_batch.data.cpu().numpy()
+
+        return video, frame_idx, video_length
+
+    def video_torchcodec(self, video_file):
+        device = "cpu"  # or e.g. "cuda"
+        decoder = VideoDecoder(video_file, device=device)
+        video, frame_idx, video_length = self.subsample_video(decoder)
         return self.process_video_frames(video, frame_idx, video_length)
 
     def process_video_frames(self, video, frame_idx, video_length):
@@ -447,11 +574,12 @@ class LazySupervisedDataset(Dataset):
         video_max_frames = getattr(self.data_args, "video_max_frames", 8)
         new_pixel = self.data_args.video_max_frame_pixels
         if len(frame_idx) < video_max_frames:
-            new_pixel = 0.95 * video_max_frames / len(frame_idx) * new_pixel
+            new_pixel = video_max_frames / len(frame_idx) * new_pixel
         processor.max_pixels = new_pixel
         processor.min_pixels = self.data_args.video_min_frame_pixels
         processor.size["longest_edge"] = processor.max_pixels
         processor.size["shortest_edge"] = processor.min_pixels
+
         video_processed = processor.preprocess(
             images=None, videos=video, return_tensors="pt"
         )
@@ -471,7 +599,6 @@ class LazySupervisedDataset(Dataset):
                 sample = self._get_item(i)
                 return sample
             except Exception as e:
-                # sleep 1s in case it is a cloud disk issue
                 print(f"[Try #{attempt_idx}] Failed to fetch sample {i}. Exception:", e)
                 time.sleep(1)
 
@@ -483,204 +610,214 @@ class LazySupervisedDataset(Dataset):
             print(f"Failed to fetch sample {i}. Try another sample.")
             return self.__getitem__(random.randint(0, len(self) - 1))
 
-    def _get_item(self, i) -> Dict[str, torch.Tensor]:
-        try:
-            sources = self.list_data_dict[i]
-            if isinstance(i, int):
-                sources = [sources]
-            assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
+    def process_source(self, source):
+        # define some variables
+        grid_thw_merged = None
+        video_grid_thw_merged = None
+        grid_thw = None
+        video_grid_thw = None
+        second_per_grid_ts = None
+        audio = None
+        audio_lengths = None
 
-            # define some variables
-            grid_thw_merged = None
-            video_grid_thw_merged = None
-            grid_thw = None
-            video_grid_thw = None
-            second_per_grid_ts = None
-            audio = None
-            audio_lengths = None
-
-            if "image" in sources[0]:
-                image_file = self.list_data_dict[i]["image"]
-                if isinstance(image_file, List):
-                    if len(image_file) > 1:
-                        image_file = [
-                            file for file in image_file
-                        ]
-                        results = [self.process_image_unified(file) for file in image_file]
-                        image, grid_thw = zip(*results)
-                    else:
-                        image_file = image_file[0]
-                        image, grid_thw = self.process_image_unified(image_file)
-                        image = [image]
+        if "image" in source:
+            image_file = source["image"]
+            if isinstance(image_file, List):
+                if len(image_file) > 1:
+                    image_file = [file for file in image_file]
+                    results = [self.process_image_unified(file) for file in image_file]
+                    image, grid_thw = zip(*results)
                 else:
+                    image_file = image_file[0]
                     image, grid_thw = self.process_image_unified(image_file)
                     image = [image]
-                grid_thw_merged = copy.deepcopy(grid_thw)
-                if not isinstance(grid_thw, Sequence):
-                    grid_thw_merged = [grid_thw_merged]
-                    grid_thw = [grid_thw]
-                grid_thw_merged = [
-                    merged_thw.prod() // self.data_args.image_processor.merge_size**2
-                    for merged_thw in grid_thw_merged
-                ]
-            if "video" in sources[0]:
-                video_file = sources[0]["video"]
-                if isinstance(video_file, List):
-                    if len(video_file) > 1:
-                        video_file = [
-                            file for file in video_file
-                        ]
-                        results = [self.process_video(file) for file in video_file]
-                        video, video_grid_thw, second_per_grid_ts = zip(*results)
-                    else:
-                        video_file = video_file[0]
-                        video, video_grid_thw, second_per_grid_ts = self.process_video(
-                            video_file
-                        )
-                        video = [video]
+            else:
+                image, grid_thw = self.process_image_unified(image_file)
+                image = [image]
+            grid_thw_merged = copy.deepcopy(grid_thw)
+            if not isinstance(grid_thw, Sequence):
+                grid_thw_merged = [grid_thw_merged]
+                grid_thw = [grid_thw]
+            grid_thw_merged = [
+                merged_thw.prod() // self.data_args.image_processor.merge_size**2
+                for merged_thw in grid_thw_merged
+            ]
+        if "video" in source:
+            video_file = source["video"]
+            if isinstance(video_file, List):
+                if len(video_file) > 1:
+                    video_file = [file for file in video_file]
+                    results = [self.process_video(file) for file in video_file]
+                    video, video_grid_thw, second_per_grid_ts = zip(*results)
                 else:
+                    video_file = video_file[0]
                     video, video_grid_thw, second_per_grid_ts = self.process_video(
                         video_file
                     )
                     video = [video]
-                if "use_audio" in sources[0] and sources[0]["use_audio"]:
-                    audio, audio_lengths = self.process_audio(
-                        video_file
-                    )
-                else:
-                    audio, audio_lengths = None, None
-                video_grid_thw_merged = copy.deepcopy(video_grid_thw)
-                if not isinstance(video_grid_thw, Sequence):
-                    video_grid_thw_merged = [video_grid_thw_merged]
-                    video_grid_thw = [video_grid_thw]
-                # video_grid_thw_merged = [
-                #     merged_thw.prod() // self.data_args.image_processor.merge_size**2
-                #     for merged_thw in video_grid_thw_merged
-                # ]
-            if "audio" in sources[0]:
-                audio_file = sources[0]["audio"]
-                audio, audio_lengths = self.process_audio(
-                    audio_file
+            else:
+                video, video_grid_thw, second_per_grid_ts = self.process_video(
+                    video_file
                 )
-            chat_sources = copy.deepcopy([e["conversations"] for e in sources])
-            data_dict = preprocess_qwen_2_visual(
-                chat_sources,
-                self.tokenizer,
-                grid_thw_image=grid_thw_merged if grid_thw_merged else None,
-                grid_thw_video=video_grid_thw_merged if video_grid_thw_merged else None,
-                audio_lengths=audio_lengths if audio_lengths else None,
-                merge_size=self.data_args.image_processor.merge_size,
-            )
-            position_ids, _ = self.get_rope_index(
+                video = [video]
+            if "use_audio" in source and source["use_audio"]:
+                try:
+                    audio, audio_lengths = self.process_audio(video_file)
+                except:
+                    print("Audio processing failed")
+                    audio, audio_lengths = None, None
+            else:
+                audio, audio_lengths = None, None
+            video_grid_thw_merged = copy.deepcopy(video_grid_thw)
+            if not isinstance(video_grid_thw, Sequence):
+                video_grid_thw_merged = [video_grid_thw_merged]
+                video_grid_thw = [video_grid_thw]
+            # video_grid_thw_merged = [
+            #     merged_thw.prod() // self.data_args.image_processor.merge_size**2
+            #     for merged_thw in video_grid_thw_merged
+            # ]
+        if "audio" in source:
+            audio_file = source["audio"]
+            audio, audio_lengths = self.process_audio(audio_file)
+        chat_sources = copy.deepcopy([source["conversations"]])
+        data_dict = preprocess_qwen_2_visual(
+            chat_sources,
+            self.tokenizer,
+            grid_thw_image=grid_thw_merged if grid_thw_merged else None,
+            grid_thw_video=video_grid_thw_merged if video_grid_thw_merged else None,
+            audio_lengths=audio_lengths if audio_lengths else None,
+            merge_size=self.data_args.image_processor.merge_size,
+        )
+
+        position_ids, _ = self.get_rope_index(
+            self.data_args.image_processor.merge_size,
+            data_dict["input_ids"],
+            image_grid_thw=torch.stack(grid_thw, dim=0) if grid_thw else None,
+            video_grid_thw=(
+                torch.stack(video_grid_thw, dim=0) if video_grid_thw else None
+            ),
+            second_per_grid_ts=second_per_grid_ts if second_per_grid_ts else None,
+            audio_lengths=audio_lengths if audio_lengths else None,
+        )
+        if data_dict["chosen_ids"] is not None:
+            chosen_position_ids, _ = self.get_rope_index(
                 self.data_args.image_processor.merge_size,
-                data_dict["input_ids"],
+                data_dict["chosen_ids"],
                 image_grid_thw=torch.stack(grid_thw, dim=0) if grid_thw else None,
                 video_grid_thw=(
                     torch.stack(video_grid_thw, dim=0) if video_grid_thw else None
                 ),
-                second_per_grid_ts=second_per_grid_ts if second_per_grid_ts else None,
+                second_per_grid_ts=(second_per_grid_ts if second_per_grid_ts else None),
                 audio_lengths=audio_lengths if audio_lengths else None,
             )
-            if data_dict["chosen_ids"] is not None:
-                chosen_position_ids, _ = self.get_rope_index(
-                    self.data_args.image_processor.merge_size,
-                    data_dict["chosen_ids"],
-                    image_grid_thw=torch.stack(grid_thw, dim=0) if grid_thw else None,
-                    video_grid_thw=(
-                        torch.stack(video_grid_thw, dim=0) if video_grid_thw else None
-                    ),
-                    second_per_grid_ts=second_per_grid_ts if second_per_grid_ts else None,
-                    audio_lengths=audio_lengths if audio_lengths else None,
-                )
+        else:
+            chosen_position_ids = None
+        if data_dict["reject_ids"] is not None:
+            reject_position_ids, _ = self.get_rope_index(
+                self.data_args.image_processor.merge_size,
+                data_dict["reject_ids"],
+                image_grid_thw=torch.stack(grid_thw, dim=0) if grid_thw else None,
+                video_grid_thw=(
+                    torch.stack(video_grid_thw, dim=0) if video_grid_thw else None
+                ),
+                second_per_grid_ts=(second_per_grid_ts if second_per_grid_ts else None),
+                audio_lengths=audio_lengths if audio_lengths else None,
+            )
+        else:
+            reject_position_ids = None
+        if "image" not in source and "video" not in source and "audio" not in source:
+            grid_thw_merged = None
+            sources = copy.deepcopy([source["conversations"]])
+            data_dict = preprocess_qwen_2_visual(sources, self.tokenizer, None, None)
+            position_ids = (
+                torch.arange(0, data_dict["input_ids"].size(1))
+                .view(1, -1)
+                .unsqueeze(0)
+                .expand(3, -1, -1)
+            )
+
+        data_dict["caption"] = source["caption"]
+        data_dict["position_ids"] = position_ids
+        data_dict["chosen_position_ids"] = chosen_position_ids
+        data_dict["reject_position_ids"] = reject_position_ids
+        data_dict["attention_mask"] = [data_dict["input_ids"][0].size(0)]
+        if data_dict["chosen_ids"] is not None:
+            data_dict["chosen_attention_mask"] = [data_dict["chosen_ids"][0].size(0)]
+        if data_dict["reject_ids"] is not None:
+            data_dict["reject_attention_mask"] = [data_dict["reject_ids"][0].size(0)]
+
+        if "image" in source:
+            data_dict["pixel_values"] = torch.cat(image, dim=0)
+            data_dict["image_grid_thw"] = torch.cat(
+                [thw.unsqueeze(0) for thw in grid_thw], dim=0
+            )
+        # video exist in the data
+        elif "video" in source:
+            data_dict["pixel_values_videos"] = torch.cat(video, dim=0)
+            data_dict["video_grid_thw"] = torch.cat(
+                [thw.unsqueeze(0) for thw in video_grid_thw], dim=0
+            )
+        if audio is not None:
+            audio = torch.cat(audio, dim=0)
+        data_dict["audio_feature"] = audio
+        data_dict["audio_lengths"] = audio_lengths
+        if data_dict["chosen_ids"] is None and self.data_args.train_type != "grpo":
+            data_dict["train_type"] = "sft"
+        else:
+            data_dict["train_type"] = self.data_args.train_type
+
+        if "video" in source:
+            data_dict["video_buffer"] = source["video"]
+            print(
+                f"DEBUG: Added video_buffer to data_dict, type: {type(source['video'])}"
+            )
+        else:
+            print(f"DEBUG: 'video' not in source. Source keys: {list(source.keys())}")
+
+        if self.data_args.run_test:
+            labels = data_dict.pop("labels", None)
+            len_input = sum(labels[0] == IGNORE_INDEX)
+            data_dict["input_ids"] = data_dict["input_ids"][:, :len_input]
+            data_dict["position_ids"] = data_dict["position_ids"][:, :, :len_input]
+            data_dict["attention_mask"] = torch.ones_like(data_dict["input_ids"])
+
+            data_dict["video"] = source.get("video", None)
+            data_dict["image"] = source.get("image", None)
+            data_dict["audio"] = source.get("audio", None)
+            data_dict["use_audio"] = source.get("use_audio", False)
+
+            data_dict["prompt"] = source["conversations"][0]
+            data_dict["ref"] = source["conversations"][1]["value"]
+            data_dict["should_use"] = source.get("should_use", True)
+            data_dict.pop("chosen_ids", None)
+            data_dict.pop("reject_ids", None)
+            data_dict.pop("chosen_position_ids", None)
+            data_dict.pop("reject_position_ids", None)
+            data_dict.pop("chosen_labels", None)
+            data_dict.pop("reject_labels", None)
+            data_dict.pop("audio_lengths", None)
+
+        for key in source:
+            if key not in data_dict:
+                data_dict[key] = source[key]
+
+        return data_dict
+
+    def _get_item(self, i) -> Dict[str, torch.Tensor]:
+        try:
+            if self.iterator:
+                sources = next(self.iterator)
             else:
-                chosen_position_ids = None
-            if data_dict["reject_ids"] is not None:
-                reject_position_ids, _ = self.get_rope_index(
-                    self.data_args.image_processor.merge_size,
-                    data_dict["reject_ids"],
-                    image_grid_thw=torch.stack(grid_thw, dim=0) if grid_thw else None,
-                    video_grid_thw=(
-                        torch.stack(video_grid_thw, dim=0) if video_grid_thw else None
-                    ),
-                    second_per_grid_ts=second_per_grid_ts if second_per_grid_ts else None,
-                    audio_lengths=audio_lengths if audio_lengths else None,
-                )
-            else:
-                reject_position_ids = None
-            if "image" not in sources[0] and "video" not in sources[0] and "audio" not in sources[0]:
-                grid_thw_merged = None
-                sources = copy.deepcopy([e["conversations"] for e in sources])
-                data_dict = preprocess_qwen_2_visual(
-                    sources, self.tokenizer, None, None
-                )
-                position_ids = (
-                    torch.arange(0, data_dict["input_ids"].size(1))
-                    .view(1, -1)
-                    .unsqueeze(0)
-                    .expand(3, -1, -1)
-                )
+                sources = self.list_data_dict[i]
 
-            data_dict["position_ids"] = position_ids
-            data_dict["chosen_position_ids"] = chosen_position_ids
-            data_dict["reject_position_ids"] = reject_position_ids
-            data_dict["attention_mask"] = [data_dict["input_ids"][0].size(0)]
-            if data_dict["chosen_ids"] is not None:
-                data_dict["chosen_attention_mask"] = [
-                    data_dict["chosen_ids"][0].size(0)
-                ]
-            if data_dict["reject_ids"] is not None:
-                data_dict["reject_attention_mask"] = [
-                    data_dict["reject_ids"][0].size(0)
-                ]
+            source = sources[0] if isinstance(sources, List) else sources
+            return self.process_source(source)
 
-            if "image" in self.list_data_dict[i]:
-                data_dict["pixel_values"] = torch.cat(image, dim=0)
-                data_dict["image_grid_thw"] = torch.cat(
-                    [thw.unsqueeze(0) for thw in grid_thw], dim=0
-                )
-            # video exist in the data
-            elif "video" in self.list_data_dict[i]:
-                data_dict["pixel_values_videos"] = torch.cat(video, dim=0)
-                data_dict["video_grid_thw"] = torch.cat(
-                    [thw.unsqueeze(0) for thw in video_grid_thw], dim=0
-                )
-            if audio is not None:
-                audio = torch.cat(audio, dim=0)
-            data_dict["audio_feature"] = audio
-            data_dict["audio_lengths"] = audio_lengths
-            if data_dict["chosen_ids"] is None and self.data_args.train_type != "grpo":
-                data_dict["train_type"] = "sft"
-            else:
-                data_dict["train_type"] = self.data_args.train_type
-            
-            if self.data_args.run_test:
-                labels = data_dict.pop("labels", None)
-                len_input = sum(labels[0] == IGNORE_INDEX)
-                data_dict["input_ids"] = data_dict["input_ids"][:, :len_input]
-                data_dict["position_ids"] = data_dict["position_ids"][:, :, :len_input]
-                data_dict["attention_mask"] = torch.ones_like(data_dict["input_ids"])
-
-                data_dict["video"] = sources[0].get("video", None)
-                data_dict["image"] = sources[0].get("image", None)
-                data_dict["audio"] = sources[0].get("audio", None)
-                data_dict["use_audio"] = sources[0].get("use_audio", False)
-
-                data_dict["prompt"] = sources[0]["conversations"][0]
-                data_dict["ref"] = sources[0]["conversations"][1]["value"]
-                data_dict["should_use"] = sources[0].get("should_use", True)
-                data_dict.pop("chosen_ids", None)
-                data_dict.pop("reject_ids", None)
-                data_dict.pop("chosen_position_ids", None)
-                data_dict.pop("reject_position_ids", None)
-                data_dict.pop("chosen_labels", None)
-                data_dict.pop("reject_labels", None)
-                data_dict.pop("audio_lengths", None)
-
-            return data_dict
         except Exception as e:
-            print(f"Error: {e}, line: {e.__traceback__.tb_lineno}")
-            raise e
+            import IPython
 
+            IPython.embed()
+            print(f"Error: {e}, line: {e.__traceback__.tb_lineno}")
 
 
 def pad_and_cat(tensor_list):
@@ -716,10 +853,13 @@ class DataCollatorForSupervisedDataset(object):
         input_ids = input_ids[:, : self.tokenizer.model_max_length]
         labels = labels[:, : self.tokenizer.model_max_length]
         position_ids = position_ids[:, : self.tokenizer.model_max_length]
-        attention_mask=input_ids.ne(self.tokenizer.pad_token_id)
+        attention_mask = input_ids.ne(self.tokenizer.pad_token_id)
         return input_ids, labels, position_ids, attention_mask
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
+        if isinstance(instances, List) and isinstance(instances[0], List):
+            instances = instances[0]
+
         input_ids, labels, position_ids = tuple(
             [instance[key] for instance in instances]
             for key in ("input_ids", "labels", "position_ids")
@@ -732,21 +872,31 @@ class DataCollatorForSupervisedDataset(object):
             for key in ("chosen_ids", "chosen_labels", "chosen_position_ids")
         )
         if chosen_ids[0] is not None:
-            chosen_ids, chosen_labels, chosen_position_ids, chosen_attention_mask = self.process_ids(
-                chosen_ids, chosen_labels, chosen_position_ids
+            chosen_ids, chosen_labels, chosen_position_ids, chosen_attention_mask = (
+                self.process_ids(chosen_ids, chosen_labels, chosen_position_ids)
             )
         else:
-            chosen_ids, chosen_labels, chosen_position_ids, chosen_attention_mask = None, None, None, None
+            chosen_ids, chosen_labels, chosen_position_ids, chosen_attention_mask = (
+                None,
+                None,
+                None,
+                None,
+            )
         reject_ids, reject_labels, reject_position_ids = tuple(
             [instance[key] for instance in instances]
             for key in ("reject_ids", "reject_labels", "reject_position_ids")
         )
         if reject_ids[0] is not None:
-            reject_ids, reject_labels, reject_position_ids, reject_attention_mask = self.process_ids(
-                reject_ids, reject_labels, reject_position_ids
+            reject_ids, reject_labels, reject_position_ids, reject_attention_mask = (
+                self.process_ids(reject_ids, reject_labels, reject_position_ids)
             )
         else:
-            reject_ids, reject_labels, reject_position_ids, reject_attention_mask = None, None, None, None
+            reject_ids, reject_labels, reject_position_ids, reject_attention_mask = (
+                None,
+                None,
+                None,
+                None,
+            )
         train_type = [instance["train_type"] for instance in instances][0]
         batch = dict(
             input_ids=input_ids,
@@ -802,7 +952,7 @@ class DataCollatorForSupervisedDataset(object):
             concat_videos = None
             video_grid_thw = None
 
-        if len(audios)!= 0:
+        if len(audios) != 0:
             concat_audios = torch.cat([audio for audio in audios], dim=0)
             audio_lengths = [
                 instance["audio_lengths"]
@@ -820,6 +970,7 @@ class DataCollatorForSupervisedDataset(object):
         batch["video_grid_thw"] = video_grid_thw
         batch["audio_feature"] = concat_audios
         batch["audio_lengths"] = audio_lengths
+        batch["video_buffer"] = [instance.get("video_buffer") for instance in instances]
         return batch
 
 

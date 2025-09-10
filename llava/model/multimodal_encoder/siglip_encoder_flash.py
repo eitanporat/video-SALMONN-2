@@ -51,7 +51,7 @@ from transformers.utils import (
     logging,
 )
 
-if is_flash_attn_2_available():
+if is_flash_attn_2_available():    
     import inspect
 
     from flash_attn import flash_attn_func, flash_attn_varlen_func
