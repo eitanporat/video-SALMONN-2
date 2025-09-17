@@ -34,7 +34,10 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 from PIL import Image
-from torchcodec.decoders import VideoDecoder, AudioDecoder
+# from torchcodec.decoders import VideoDecoder, AudioDecoder
+import soundfile as sf
+import librosa
+import imageio.v3 as iio
 import transformers
 
 from .rope2d import get_rope_index_25, get_rope_index_2
@@ -253,10 +256,14 @@ def preprocess_qwen_2_visual(
 class LazySupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
 
-    def __init__(self, tokenizer: transformers.PreTrainedTokenizer, data_args):
+    def __init__(self, tokenizer: transformers.PreTrainedTokenizer, data_args, mode='eval'):
         super(LazySupervisedDataset, self).__init__()
 
-        dataset = data_args.dataset_use.split(",")
+        dataset = (data_args.eval_dataset_use if mode == 'eval' else data_args.dataset_use).split(",")
+        self.dataset_path = dataset
+
+        print(f"{dataset=}")
+
         dataset_list = dataset
         rank0_print(f"Loading datasets: {dataset_list}")
         self.video_max_total_pixels = getattr(
@@ -340,46 +347,114 @@ class LazySupervisedDataset(Dataset):
             print("No pre-calculated length available.")
             return np.array([1] * len(self.list_data_dict))
 
-    def process_audio(self, audio_file):
-        try:
-            audio_kwargs = {
-                "sampling_rate": 16000,
-                "padding": "max_length",
-                "return_attention_mask": False,
-            }
-            processor = copy.deepcopy(self.data_args.audio_processor)
-            if isinstance(audio_file, list):
-                audio_data = []
-                for file in audio_file:
-                    decoder = AudioDecoder(
-                        file,
-                        sample_rate=audio_kwargs["sampling_rate"],
-                        num_channels=1,
-                    )
-                    audio = decoder.get_all_samples()
-                    audio_data.append(audio.data.numpy().squeeze(0))
-            else:
-                decoder = AudioDecoder(
-                    audio_file,
-                    sample_rate=audio_kwargs["sampling_rate"],
-                    num_channels=1,
-                )
-                audio = decoder.get_all_samples()
-                audio_data = [audio.data.numpy().squeeze(0)]
-            audio_inputs = []
-            audio_lengths = []
-            for idx in range(len(audio_data)):
-                if audio_data[idx].shape[0] < audio_kwargs["sampling_rate"]:
-                    padding = audio_kwargs["sampling_rate"] - audio_data[idx].shape[0]
-                    audio_data[idx] = np.pad(audio_data[idx], (0, padding), mode="constant", constant_values=0)
-                audio_lst = [audio_data[idx][k: k + 30 * audio_kwargs["sampling_rate"]] for k in range(0, len(audio_data[idx]), 30 * audio_kwargs["sampling_rate"])]
-                spectrogram_lst = [processor(a, sampling_rate=audio_kwargs["sampling_rate"], return_tensors="pt")["input_features"].squeeze() for a in audio_lst]
-                audio_inputs.append(torch.stack(spectrogram_lst, dim=0))
-                audio_lengths.append(math.ceil(len(audio_data[idx]) / (30 * audio_kwargs["sampling_rate"])) * 60)
-            return audio_inputs, audio_lengths
-        except:
-            return None, None
 
+    def process_audio(self, audio_file):
+        """
+        Robust NumPy-based audio loading with 'no-audio' handling.
+
+        - If a video has no audio stream, return (None, None) gracefully.
+        - Try soundfile for stand-alone audio. Otherwise decode via ffmpeg to 16k mono PCM.
+        """
+        import subprocess
+        import json
+
+        target_sr = 16000
+        processor = copy.deepcopy(self.data_args.audio_processor)
+
+        def _has_audio_stream(path: str) -> bool:
+            # Ask ffprobe if there is any audio stream
+            cmd = [
+                "ffprobe", "-v", "error", "-select_streams", "a",
+                "-show_entries", "stream=codec_type",
+                "-of", "json", path
+            ]
+            try:
+                res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, timeout=5)
+                data = json.loads(res.stdout.decode("utf-8") or "{}")
+                streams = data.get("streams", [])
+                return any(s.get("codec_type") == "audio" for s in streams)
+            except subprocess.TimeoutExpired:
+                print(f"[ffprobe-timeout] {path}")
+                return False
+            except Exception as e:
+                print(f"[ffprobe-fail] {path}: {e}")
+                return False
+
+        def _ffmpeg_decode_to_np(path: str, target_sr: int) -> np.ndarray:
+            # Decode to raw s16le PCM mono 16k
+            # Only call this if we know an audio stream exists
+            cmd = [
+                "ffmpeg", "-v", "error",
+                "-i", path,
+                "-f", "s16le", "-acodec", "pcm_s16le",
+                "-ac", "1", "-ar", str(target_sr),
+                "-"
+            ]
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, timeout=5)
+            audio_bytes = proc.stdout
+            if not audio_bytes:
+                raise RuntimeError("FFmpeg produced no PCM bytes (possibly a zero-length or unsupported stream).")
+            pcm = np.frombuffer(audio_bytes, dtype=np.int16)
+            return (pcm.astype(np.float32)) / 32768.0
+
+        def _load_one(path):
+            # 1) Try soundfile first (for wav/flac/ogg etc.)
+            try:
+                wav, sr = sf.read(path, always_2d=False, dtype="float32")
+                if wav.ndim == 2:
+                    wav = wav.mean(axis=1)  # mono
+                if sr != target_sr:
+                    wav = librosa.resample(wav, orig_sr=sr, target_sr=target_sr)
+                return wav
+            except Exception:
+                # 2) If it’s not a plain audio file, check if there’s any audio stream in the container.
+                if not _has_audio_stream(path):
+                    print("No audio found returning zeros")
+                    # No audio track at all → signal caller to skip
+                    return np.zeros(target_sr * 30)
+                # 3) Decode with ffmpeg
+                return _ffmpeg_decode_to_np(path, target_sr)
+
+        try:
+            files = audio_file if isinstance(audio_file, list) else [audio_file]
+            audio_arrays = []
+            for f in files:
+                arr = _load_one(f)
+                if arr is None:
+                    # This file has no audio stream; skip it
+                    continue
+                audio_arrays.append(arr)
+
+            # If none of the files yielded audio, return None to follow your no-audio code path
+            if len(audio_arrays) == 0:
+                return None, None
+
+            # Chunk into 30s segments and build features
+            chunk_len = 30 * target_sr
+            audio_inputs, audio_lengths = [], []
+            for arr in audio_arrays:
+                if arr.shape[0] < target_sr:
+                    pad = target_sr - arr.shape[0]
+                    arr = np.pad(arr, (0, pad), mode="constant", constant_values=0.0)
+                chunks = [arr[i:i + chunk_len] for i in range(0, len(arr), chunk_len)]
+                specs = [
+                    processor(c, sampling_rate=target_sr, return_tensors="pt")["input_features"].squeeze(0)
+                    for c in chunks
+                ]
+                audio_inputs.append(torch.stack(specs, dim=0))
+                # Your code expects minutes (ceil seconds/30s * 60) — keep your original logic
+                audio_lengths.append(math.ceil(len(arr) / chunk_len) * 60)
+
+            return audio_inputs, audio_lengths
+
+        except subprocess.CalledProcessError as e:
+            # FFmpeg/ffprobe hard failure — treat as no-audio for resilience
+            print(f"Audio processing failed (ffmpeg): {e}. Stderr: {getattr(e, 'stderr', b'').decode(errors='ignore')}")
+            return None, None
+        except Exception as e:
+            print(f"Audio processing failed: {e}")
+            return None, None
+            
 
     def process_image_unified(self, image_file):
         processor = copy.deepcopy(self.data_args.image_processor)
@@ -393,16 +468,34 @@ class LazySupervisedDataset(Dataset):
         return image_tensor, grid_thw
 
     def process_video(self, video_file):
-        torchcodec_video = None
         try:
-            torchcodec_video = self.video_torchcodec(video_file)
-            return torchcodec_video
-        except:
-            try:
-                decord_video = self.read_video_decord(video_file)
-                return decord_video
-            except Exception as e:
-                print(f"torchcodec attempt failed: {e}")
+            return self.read_video_decord(video_file)
+        except Exception as e:
+            print(f"[Decord fallback] {e}")
+            return self.read_video_imageio(video_file)
+
+    def read_video_imageio(self, video_file):
+        # Read frames as (T, H, W, C) uint8 using imageio (pyav backend)
+        frames = iio.imread(video_file, plugin="pyav")  # -> iterator OR array
+        if not isinstance(frames, np.ndarray):
+            frames = np.stack(list(frames), axis=0)
+        total_frame_num = frames.shape[0]
+
+        # We don’t always get fps from imageio reliably; keep a sane default
+        # and sub-sample uniformly to your target budget.
+        # If you know fps, you can pass it in via metadata and compute like decord.
+        default_fps = 30.0
+        interval = getattr(self.data_args, "base_interval", 4)
+        video_length = total_frame_num / default_fps
+
+        video_min_frames = getattr(self.data_args, "video_min_frames", 4)
+        video_max_frames = getattr(self.data_args, "video_max_frames", 8)
+
+        target_frames = max(video_min_frames, min(video_max_frames, round(video_length / interval)))
+        idx = np.linspace(0, total_frame_num - 1, target_frames, dtype=int)
+
+        video = frames[idx].transpose(0, 3, 1, 2)  # (T, C, H, W) like decord path
+        return self.process_video_frames(video, idx, video_length)
 
     def read_video_decord(self, video_file):
         vr = VideoReader(video_file, ctx=cpu(0), num_threads=1)
@@ -646,6 +739,8 @@ class LazySupervisedDataset(Dataset):
                 )
             if audio is not None:
                 audio = torch.cat(audio, dim=0)
+            
+            data_dict["video"] = sources[0].get("video", None)
             data_dict["audio_feature"] = audio
             data_dict["audio_lengths"] = audio_lengths
             if data_dict["chosen_ids"] is None and self.data_args.train_type != "grpo":
@@ -660,7 +755,6 @@ class LazySupervisedDataset(Dataset):
                 data_dict["position_ids"] = data_dict["position_ids"][:, :, :len_input]
                 data_dict["attention_mask"] = torch.ones_like(data_dict["input_ids"])
 
-                data_dict["video"] = sources[0].get("video", None)
                 data_dict["image"] = sources[0].get("image", None)
                 data_dict["audio"] = sources[0].get("audio", None)
                 data_dict["use_audio"] = sources[0].get("use_audio", False)
@@ -750,6 +844,7 @@ class DataCollatorForSupervisedDataset(object):
         train_type = [instance["train_type"] for instance in instances][0]
         batch = dict(
             input_ids=input_ids,
+            video=[instance['video'] for instance in instances],
             labels=labels,
             position_ids=position_ids,
             chosen_ids=chosen_ids,
@@ -803,13 +898,14 @@ class DataCollatorForSupervisedDataset(object):
             video_grid_thw = None
 
         if len(audios)!= 0:
-            concat_audios = torch.cat([audio for audio in audios], dim=0)
+            concat_audios = torch.cat([audio for audio in audios if audio is not None], dim=0)
             audio_lengths = [
                 instance["audio_lengths"]
                 for instance in instances
                 if "audio_lengths" in instance
             ]
-            audio_lengths = [l for length in audio_lengths for l in length]
+            audio_lengths = [l if isinstance(l, list) else [l] for l in audio_lengths]
+            audio_lengths = [l for length in audio_lengths for l in length if l]
         else:
             concat_audios = None
             audio_lengths = None
@@ -901,10 +997,11 @@ def make_supervised_data_module(
     tokenizer: transformers.PreTrainedTokenizer, data_args
 ) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
-    train_dataset = LazySupervisedDataset(tokenizer=tokenizer, data_args=data_args)
+    train_dataset = LazySupervisedDataset(tokenizer=tokenizer, data_args=data_args, mode='train')
+    eval_dataset = LazySupervisedDataset(tokenizer=tokenizer, data_args=data_args, mode='eval')
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
     return dict(
-        train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator
+        train_dataset=train_dataset, eval_dataset=eval_dataset, data_collator=data_collator
     )
 
 
