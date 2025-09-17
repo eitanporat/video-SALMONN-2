@@ -13,6 +13,11 @@
 # limitations under the License.
 
 # Adopted from https://github.com/QwenLM/Qwen2.5-VL. The original license is located at 'third-party-license/qwenvl.txt'.
+import numpy as np
+from torch.serialization import add_safe_globals
+
+# allowlist the legacy numpy reconstruct function used in old pickles
+add_safe_globals([np.core.multiarray._reconstruct])
 
 import os
 import logging
@@ -121,6 +126,8 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
         del state_dict
         trainer._save(output_dir, state_dict=cpu_state_dict)  # noqa
 
+#import wandb
+#wandb.init()
 
 def set_model(model_args, model):
     if model_args.tune_mm_vision:
@@ -182,7 +189,7 @@ def train(attn_implementation="flash_attention_2"):
     os.makedirs(training_args.output_dir, exist_ok=True)
 
     data_args.image_processor = Qwen2VLImageProcessorFast.from_pretrained(
-        model_args.model_base,
+        'Qwen/Qwen2.5-VL-7B-Instruct',
     )
     data_args.audio_processor = WhisperFeatureExtractor(
         feature_size=data_args.feature_size, 
@@ -203,9 +210,10 @@ def train(attn_implementation="flash_attention_2"):
 
     if not data_args.run_test:
         data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
-        # time.sleep(random.randint(0, 20))
+        data = next(iter(data_module['train_dataset']))
+        time.sleep(random.randint(0, 2))
         # print(f"RANK {dist.get_rank()} before barrier")
-        dist.barrier(device_ids=dist.get_rank())
+        # dist.barrier(device_ids=dist.get_rank())
         # print(f"RANK {dist.get_rank()} after barrier")
         model = video_SALMONN2_plus.from_pretrained(
             model_args.model_name_or_path,
@@ -235,15 +243,17 @@ def train(attn_implementation="flash_attention_2"):
             del model.audio.layers
             model = PeftModel.from_pretrained(model, model_args.lora_ckpt)
             model.model.audio.layers = audio_layers
-            model = model.merge_and_unload()
+            model = model.merge_and_unload(safe_merge=True)
             model.save_pretrained(os.path.join(training_args.output_dir, "base/"))
 
         set_model(model_args, model)
 
         if training_args.no_audio:
+            print("No audio")
             del model.audio
 
         if model_args.use_lora:
+            print("Use lora")
             from peft import LoraConfig, get_peft_model
             module_to_save = []
             if model_args.tune_mm_vision:
@@ -259,7 +269,7 @@ def train(attn_implementation="flash_attention_2"):
             lora_config = LoraConfig(
                 r=model_args.lora_r,
                 lora_alpha=model_args.lora_alpha,
-                target_modules=["q_proj", "k_proj", "v_proj"], # find_all_linear_names(model),
+                target_modules="all-linear", # find_all_linear_names(model),
                 lora_dropout=model_args.lora_dropout,
                 bias=model_args.lora_bias,
                 task_type="CAUSAL_LM",
@@ -280,10 +290,10 @@ def train(attn_implementation="flash_attention_2"):
             for k, v in model.named_parameters():
                 if v.requires_grad:
                     print(k, v.shape)
-            # print(model.model.visual.merger)
 
         trainer = QwenVLTrainer(
-            model=model, processing_class=tokenizer, args=training_args, **data_module
+            model=model, processing_class=tokenizer, args=training_args, 
+            **data_module
         )
         
         if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
@@ -321,7 +331,7 @@ def train(attn_implementation="flash_attention_2"):
                 model = PeftModel.from_pretrained(model, model_args.lora_ckpt)
                 if not training_args.no_audio:
                     model.model.audio.layers = audio_layers
-                model = model.merge_and_unload()
+                model = model.merge_and_unload(safe_merge=True)
 
                 if torch.cuda.device_count() > 1:
                     model.save_pretrained(os.path.join(training_args.output_dir, "generation"))
