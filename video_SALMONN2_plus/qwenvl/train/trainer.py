@@ -41,7 +41,7 @@ from transformers.trainer import (
     is_sagemaker_mp_enabled,
 )
 import torch.distributed as dist
-
+import wandb
 from transformers.trainer_utils import (
     PREFIX_CHECKPOINT_DIR,
     SaveStrategy,
@@ -75,7 +75,108 @@ class QwenVLTrainer(Trainer):
         super().__init__(*args, **kwargs)
         self.dpo_loss_fct = LigerFusedLinearDPOLoss()
 
-    
+        print(f"{self.eval_dataset.dataset_path=}")
+
+        self.eval_iterator = iter(self.eval_dataset)
+
+    @torch.no_grad()
+    def evaluate(self, eval_dataset=None, **kwargs):
+        if not self.is_world_process_zero():
+            return
+
+        self.model.eval()
+
+        batch = next(self.eval_iterator)
+
+        collated_batch = self.data_collator([batch])
+
+        loss, preds, labels = self.prediction_step(
+            self.model, collated_batch, prediction_loss_only=False
+        )
+
+        metrics = {}
+        if loss is not None:
+            metrics["eval_loss"] = float(loss.item())
+
+        wandb.log(metrics)
+        self.callback_handler.on_evaluate(self.args, self.state, self.control, metrics)
+
+        self._debug_generate_and_log(sample := batch)
+
+        return metrics
+
+    @torch.no_grad()
+    def _debug_generate_and_log(self, batch):
+        print(f"{batch=}")
+        if not self.is_world_process_zero() or batch is None:
+            return
+
+        tok = self.tokenizer
+        video = batch.pop("video", None)
+        print(f"Video: {video}")
+        for k, v in batch.items():
+            try:
+                print(k, v.shape, v.dtype)
+            except:
+                ...
+
+        if video is None:
+            return
+
+        should_use = batch.pop("should_use", True)
+        if not should_use or video is None:
+            return
+
+        dev = next(self.model.parameters()).device
+        inputs = {
+            k: v.clone().to(dev) for k, v in batch.items() if torch.is_tensor(v)
+        }  # we don't need labels for generation
+
+        inputs["input_ids"] = inputs["input_ids"].unsqueeze(0) if inputs["input_ids"].dim() == 1 else inputs["input_ids"]
+
+        IGNORE_INDEX = -100
+        keep_mask = batch["labels"].ravel() == IGNORE_INDEX
+        keep_mask[-2:] = False
+
+        # assert batch["input_ids"].shape[0] == batch["position_ids"].shape[2]
+        inputs["input_ids"] = batch["input_ids"][:, keep_mask].to(dev)
+        inputs["position_ids"] = batch["position_ids"][:, :, keep_mask].to(dev)
+
+        with torch.inference_mode():
+            out = self.model.generate(
+                **inputs,
+                max_new_tokens=2048,
+                do_sample=True,
+                top_p=0.9,
+                temperature=0.2,
+            )
+
+        self.model.train()
+
+        gen_tokens = (
+            out[0, inputs["input_ids"].shape[1] :] if "input_ids" in inputs else out[0]
+        )
+        pred = tok.decode(
+            gen_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )
+
+        ref = batch["input_ids"][0, ~keep_mask]
+        ref = tok.decode(
+            ref, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )
+
+        table = wandb.Table(columns=["video", "reference", "prediction"])
+        table.add_data(
+            wandb.Video(video, format="mp4"),
+            str(ref).strip(),
+            str(pred).strip(),
+        )
+
+        print("Logged table at step", self.state.global_step)
+        print(f"Ref: {str(ref)}\nPred: {str(pred)}")
+
+        wandb.log({f"eval/table-{self.state.global_step}": table})    
+
     def create_optimizer(self):
         opt_model = self.model
 
