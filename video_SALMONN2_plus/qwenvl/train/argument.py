@@ -38,6 +38,7 @@ class ModelArguments:
 @dataclass
 class DataArguments:
     dataset_use: str = field(default="")
+    eval_dataset_use: str = field(default="")
     video_max_frames: Optional[int] = field(default=8)
     video_min_frames: Optional[int] = field(default=4)
     base_interval: float = field(default=2)
